@@ -273,3 +273,178 @@ func TestGracefulShutdown(t *testing.T) {
 		t.Error("Expected final state to be healthy")
 	}
 }
+
+func TestAutoUpdate(t *testing.T) {
+	ctx := context.Background()
+	ha := NewHealthAggregator(ctx,
+		WithAutoUpdate(100*time.Millisecond),
+		WithInitialDelay(50*time.Millisecond),
+	)
+	checker := &mockHealthChecker{name: "test", priority: PriorityCritical}
+
+	ha.RegisterHealthCheck(checker, PriorityCritical)
+	ha.Start()
+	defer ha.Stop()
+
+	// Wait for initial delay and first check
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify that checks were performed
+	if checker.checkCount < 2 {
+		t.Errorf("Expected at least 2 checks, got %d", checker.checkCount)
+	}
+
+	// Verify that status was updated
+	ha.mu.RLock()
+	status := ha.statuses[checker.name]
+	ha.mu.RUnlock()
+
+	if status == nil {
+		t.Fatal("Expected status to be updated")
+	}
+}
+
+func TestAutoUpdateBackoff(t *testing.T) {
+	ctx := context.Background()
+	checkInterval := 50 * time.Millisecond
+	initialBackoff := checkInterval
+	maxBackoff := 200 * time.Millisecond
+	backoffFactor := 2.0
+
+	ha := NewHealthAggregator(ctx,
+		WithAutoUpdate(checkInterval),
+		WithInitialDelay(0),
+		WithBackoff(maxBackoff, backoffFactor),
+	)
+	checker := &mockHealthChecker{
+		name:         "test",
+		priority:     PriorityCritical,
+		livenessErr:  errors.New("test error"),
+		readinessErr: errors.New("test error"),
+	}
+
+	ha.RegisterHealthCheck(checker, PriorityCritical)
+	ha.Start()
+	defer ha.Stop()
+
+	// Wait for initial check and first backoff period
+	time.Sleep(initialBackoff + 10*time.Millisecond)
+
+	// Verify initial backoff was applied
+	ha.mu.RLock()
+	backoff := ha.backoffTimes[checker.name]
+	ha.mu.RUnlock()
+
+	if backoff != initialBackoff {
+		t.Errorf("Expected initial backoff of %v, got %v", initialBackoff, backoff)
+	}
+
+	// Wait for second backoff period
+	time.Sleep(time.Duration(float64(initialBackoff)*backoffFactor) + 10*time.Millisecond)
+
+	// Verify backoff increased
+	ha.mu.RLock()
+	backoff = ha.backoffTimes[checker.name]
+	ha.mu.RUnlock()
+
+	expectedBackoff := time.Duration(float64(initialBackoff) * backoffFactor)
+	if backoff != expectedBackoff {
+		t.Errorf("Expected backoff of %v, got %v", expectedBackoff, backoff)
+	}
+
+	// Verify check count is reasonable
+	// Should have at least 2 checks (initial + after first backoff)
+	// and at most 3 checks (if timing allows)
+	// Note: Each check calls both CheckLiveness and CheckReadiness, so checkCount is doubled
+	actualChecks := checker.checkCount / 2
+	if actualChecks < 2 || actualChecks > 3 {
+		t.Errorf("Expected 2-3 checks, got %d", actualChecks)
+	}
+}
+
+func TestAutoUpdateInitialDelay(t *testing.T) {
+	ctx := context.Background()
+	ha := NewHealthAggregator(ctx,
+		WithAutoUpdate(50*time.Millisecond),
+		WithInitialDelay(100*time.Millisecond),
+	)
+	checker := &mockHealthChecker{name: "test", priority: PriorityCritical}
+
+	ha.RegisterHealthCheck(checker, PriorityCritical)
+	ha.Start()
+	defer ha.Stop()
+
+	// Wait less than initial delay
+	time.Sleep(50 * time.Millisecond)
+
+	// Verify no checks were performed
+	if checker.checkCount > 0 {
+		t.Errorf("Expected no checks before initial delay, got %d", checker.checkCount)
+	}
+
+	// Wait past initial delay
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify checks were performed
+	if checker.checkCount == 0 {
+		t.Error("Expected checks to be performed after initial delay")
+	}
+}
+
+func TestAutoUpdateMultipleCheckers(t *testing.T) {
+	ctx := context.Background()
+	ha := NewHealthAggregator(ctx,
+		WithAutoUpdate(50*time.Millisecond),
+		WithInitialDelay(0),
+	)
+
+	checkers := []*mockHealthChecker{
+		{name: "checker1", priority: PriorityCritical},
+		{name: "checker2", priority: PriorityHigh},
+		{name: "checker3", priority: PriorityMedium},
+	}
+
+	for _, checker := range checkers {
+		ha.RegisterHealthCheck(checker, checker.priority)
+	}
+
+	ha.Start()
+	defer ha.Stop()
+
+	// Wait for checks to be performed
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify all checkers were checked
+	for _, checker := range checkers {
+		if checker.checkCount < 2 {
+			t.Errorf("Expected at least 2 checks for %s, got %d", checker.name, checker.checkCount)
+		}
+	}
+}
+
+func TestAutoUpdateStop(t *testing.T) {
+	ctx := context.Background()
+	ha := NewHealthAggregator(ctx,
+		WithAutoUpdate(50*time.Millisecond),
+		WithInitialDelay(0),
+	)
+	checker := &mockHealthChecker{name: "test", priority: PriorityCritical}
+
+	ha.RegisterHealthCheck(checker, PriorityCritical)
+	ha.Start()
+
+	// Wait for some checks
+	time.Sleep(100 * time.Millisecond)
+	initialCount := checker.checkCount
+
+	// Stop the aggregator
+	ha.Stop()
+
+	// Wait for potential additional checks
+	time.Sleep(100 * time.Millisecond)
+
+	// Verify no additional checks were performed
+	if checker.checkCount != initialCount {
+		t.Errorf("Expected no additional checks after stop, got %d more", checker.checkCount-initialCount)
+	}
+}

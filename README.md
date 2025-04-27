@@ -11,6 +11,8 @@ A powerful, event-driven health monitoring system for Go applications that suppo
 - **Graceful Shutdown**: Context-based cancellation support
 - **Thread-safe**: Safe for concurrent use
 - **Extensible**: Easy to add new health checkers
+- **Auto-update**: Automatic periodic health checks with backoff
+- **Configurable Backoff**: Exponential backoff for failed checks
 
 ## Installation
 
@@ -35,6 +37,9 @@ func main() {
     // Create a new health aggregator with custom configuration
     ctx := context.Background()
     aggregator := gopulse.NewHealthAggregator(ctx,
+        gopulse.WithAutoUpdate(10*time.Second),           // Check every 10 seconds
+        gopulse.WithInitialDelay(2*time.Second),          // Wait 2 seconds before first check
+        gopulse.WithBackoff(60*time.Second, 1.5),         // Max backoff 60s, factor 1.5
         gopulse.WithExpiryTime(30*time.Second),
         gopulse.WithUpdateBuffer(100),
         gopulse.WithStatusChangeCallback(func(name string, status *gopulse.HealthStatus) {
@@ -43,7 +48,7 @@ func main() {
         }),
     )
 
-    // Start the aggregator
+    // Start the aggregator (auto-updates will begin)
     aggregator.Start()
     defer aggregator.Stop()
 
@@ -51,7 +56,7 @@ func main() {
     dbChecker := &DBHealthChecker{}
     aggregator.RegisterHealthCheck(dbChecker, gopulse.PriorityCritical)
 
-    // Update health status
+    // Manual health update (optional when auto-update is enabled)
     livenessErr := dbChecker.CheckLiveness()
     readinessErr := dbChecker.CheckReadiness()
     aggregator.UpdateHealth(dbChecker, livenessErr, readinessErr)
@@ -66,9 +71,26 @@ func main() {
 
 The health aggregator can be configured using functional options:
 
+### Basic Configuration
 - `WithExpiryTime(d time.Duration)`: Set the expiry time for health checks
 - `WithUpdateBuffer(size int)`: Set the size of the update channel buffer
 - `WithStatusChangeCallback(callback func(name string, status *HealthStatus))`: Set a callback for status changes
+
+### Auto-update Configuration
+- `WithAutoUpdate(interval time.Duration)`: Enable automatic health checking with specified interval
+- `WithInitialDelay(delay time.Duration)`: Set delay before starting auto-updates
+- `WithBackoff(maxBackoff time.Duration, factor float64)`: Configure backoff for failed checks
+
+### Default Configuration
+```go
+ExpiryTime:        30 * time.Second
+UpdateBuffer:      100
+AutoUpdateEnabled: false
+CheckInterval:     5 * time.Second
+InitialDelay:      1 * time.Second
+MaxBackoff:        30 * time.Second
+BackoffFactor:     2.0
+```
 
 ## Priority Levels
 
@@ -120,7 +142,7 @@ func (c *DBHealthChecker) CheckReadiness() error {
 // NewHealthAggregator creates a new health aggregator instance
 func NewHealthAggregator(ctx context.Context, opts ...Option) *HealthAggregator
 
-// Start begins processing health updates
+// Start begins processing health updates and auto-updates if enabled
 func (ha *HealthAggregator) Start()
 
 // Stop gracefully shuts down the health aggregator
@@ -160,6 +182,14 @@ func (ha *HealthAggregator) GetOverallHealth() (liveness, readiness bool, livene
    - Set appropriate expiry times based on your service requirements
    - Configure buffer sizes based on expected update frequency
    - Use status change callbacks for monitoring and alerting
+   - Enable auto-update for critical services
+   - Configure backoff to prevent overwhelming failed services
+
+4. **Auto-update Configuration**:
+   - Set appropriate check intervals based on service criticality
+   - Use initial delay to allow services to initialize
+   - Configure backoff to handle temporary failures
+   - Monitor backoff times for persistent issues
 
 ## License
 

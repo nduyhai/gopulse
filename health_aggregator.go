@@ -33,6 +33,12 @@ type Config struct {
 	ExpiryTime     time.Duration
 	UpdateBuffer   int
 	OnStatusChange func(name string, status *HealthStatus)
+	// Auto update configuration
+	AutoUpdateEnabled bool
+	CheckInterval     time.Duration
+	InitialDelay      time.Duration
+	MaxBackoff        time.Duration
+	BackoffFactor     float64
 }
 
 // Option is a function that configures the HealthAggregator
@@ -59,12 +65,40 @@ func WithStatusChangeCallback(callback func(name string, status *HealthStatus)) 
 	}
 }
 
+// WithAutoUpdate enables automatic health checking with the specified interval
+func WithAutoUpdate(interval time.Duration) Option {
+	return func(c *Config) {
+		c.AutoUpdateEnabled = true
+		c.CheckInterval = interval
+	}
+}
+
+// WithInitialDelay sets the initial delay before starting auto-updates
+func WithInitialDelay(delay time.Duration) Option {
+	return func(c *Config) {
+		c.InitialDelay = delay
+	}
+}
+
+// WithBackoff sets the backoff configuration for failed checks
+func WithBackoff(maxBackoff time.Duration, factor float64) Option {
+	return func(c *Config) {
+		c.MaxBackoff = maxBackoff
+		c.BackoffFactor = factor
+	}
+}
+
 // defaultConfig returns the default configuration
 func defaultConfig() *Config {
 	return &Config{
-		ExpiryTime:     30 * time.Second,
-		UpdateBuffer:   100,
-		OnStatusChange: nil,
+		ExpiryTime:        30 * time.Second,
+		UpdateBuffer:      100,
+		OnStatusChange:    nil,
+		AutoUpdateEnabled: false,
+		CheckInterval:     5 * time.Second,
+		InitialDelay:      1 * time.Second,
+		MaxBackoff:        30 * time.Second,
+		BackoffFactor:     2.0,
 	}
 }
 
@@ -76,6 +110,10 @@ type HealthAggregator struct {
 	ctx           context.Context
 	cancel        context.CancelFunc
 	updateChannel chan *HealthStatus
+	// Auto update state
+	checkers         map[string]HealthChecker
+	backoffTimes     map[string]time.Duration
+	lastCheckAttempt map[string]time.Time
 }
 
 // NewHealthAggregator creates a new health aggregator instance with optional configuration
@@ -87,17 +125,23 @@ func NewHealthAggregator(ctx context.Context, opts ...Option) *HealthAggregator 
 
 	ctx, cancel := context.WithCancel(ctx)
 	return &HealthAggregator{
-		statuses:      make(map[string]*HealthStatus),
-		config:        config,
-		ctx:           ctx,
-		cancel:        cancel,
-		updateChannel: make(chan *HealthStatus, config.UpdateBuffer),
+		statuses:         make(map[string]*HealthStatus),
+		config:           config,
+		ctx:              ctx,
+		cancel:           cancel,
+		updateChannel:    make(chan *HealthStatus, config.UpdateBuffer),
+		checkers:         make(map[string]HealthChecker),
+		backoffTimes:     make(map[string]time.Duration),
+		lastCheckAttempt: make(map[string]time.Time),
 	}
 }
 
-// Start begins processing health updates
+// Start begins processing health updates and auto-updates if enabled
 func (ha *HealthAggregator) Start() {
 	go ha.processUpdates()
+	if ha.config.AutoUpdateEnabled {
+		go ha.autoUpdate()
+	}
 }
 
 // Stop gracefully shuts down the health aggregator
@@ -110,7 +154,9 @@ func (ha *HealthAggregator) RegisterHealthCheck(checker HealthChecker, priority 
 	ha.mu.Lock()
 	defer ha.mu.Unlock()
 
-	ha.statuses[checker.Name()] = &HealthStatus{
+	name := checker.Name()
+	ha.checkers[name] = checker
+	ha.statuses[name] = &HealthStatus{
 		Checker:    checker,
 		Priority:   priority,
 		LastUpdate: time.Now(),
@@ -225,6 +271,103 @@ func (ha *HealthAggregator) processUpdates() {
 			}
 		}
 	}
+}
+
+// autoUpdate performs automatic health checks for registered checkers
+func (ha *HealthAggregator) autoUpdate() {
+	// Initial delay
+	select {
+	case <-ha.ctx.Done():
+		return
+	case <-time.After(ha.config.InitialDelay):
+		// Perform initial checks immediately after delay
+		ha.mu.RLock()
+		checkers := make([]HealthChecker, 0, len(ha.checkers))
+		for _, checker := range ha.checkers {
+			checkers = append(checkers, checker)
+		}
+		ha.mu.RUnlock()
+
+		for _, checker := range checkers {
+			ha.checkHealth(checker)
+		}
+	}
+
+	ticker := time.NewTicker(ha.config.CheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ha.ctx.Done():
+			return
+		case <-ticker.C:
+			ha.mu.RLock()
+			checkers := make([]HealthChecker, 0, len(ha.checkers))
+			for _, checker := range ha.checkers {
+				checkers = append(checkers, checker)
+			}
+			ha.mu.RUnlock()
+
+			for _, checker := range checkers {
+				ha.checkHealth(checker)
+			}
+		}
+	}
+}
+
+// checkHealth performs a health check with backoff
+func (ha *HealthAggregator) checkHealth(checker HealthChecker) {
+	name := checker.Name()
+	now := time.Now()
+
+	// Check if we should skip this check due to backoff
+	ha.mu.RLock()
+	backoff := ha.backoffTimes[name]
+	lastAttempt, exists := ha.lastCheckAttempt[name]
+	ha.mu.RUnlock()
+
+	if backoff > 0 && exists {
+		// Calculate time since last check attempt
+		timeSinceLastAttempt := now.Sub(lastAttempt)
+		if timeSinceLastAttempt < backoff {
+			// Skip this check as we're still in backoff period
+			return
+		}
+	}
+
+	// Update last check attempt time before performing the check
+	ha.mu.Lock()
+	ha.lastCheckAttempt[name] = now
+	ha.mu.Unlock()
+
+	// Perform health checks
+	livenessErr := checker.CheckLiveness()
+	readinessErr := checker.CheckReadiness()
+
+	// Update backoff time based on check results
+	ha.mu.Lock()
+	if livenessErr != nil || readinessErr != nil {
+		// Increase backoff time
+		if backoff == 0 {
+			// Start with check interval as initial backoff
+			backoff = ha.config.CheckInterval / 2
+		} else {
+			// Exponential backoff
+			backoff = time.Duration(float64(backoff) * ha.config.BackoffFactor)
+		}
+		// Cap at max backoff
+		if backoff > ha.config.MaxBackoff {
+			backoff = ha.config.MaxBackoff
+		}
+		ha.backoffTimes[name] = backoff
+	} else {
+		// Reset backoff on success
+		ha.backoffTimes[name] = 0
+	}
+	ha.mu.Unlock()
+
+	// Send update
+	ha.UpdateHealth(checker, livenessErr, readinessErr)
 }
 
 // ErrHealthCheckExpired is returned when a health check has not been updated within the expiry time
