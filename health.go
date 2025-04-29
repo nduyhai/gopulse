@@ -14,3 +14,32 @@ type HealthChecker interface {
 	// CheckReadiness and CheckReadiness are called by the Pulse to perform the health checks.
 	CheckReadiness() error
 }
+
+type Status string
+
+const (
+	StatusUp   Status = "UP"
+	StatusDown Status = "DOWN"
+)
+
+type PulseResponse struct {
+	Status  Status            `json:"status"`
+	Details map[string]Status `json:"details,omitempty"`
+}
+
+func NewDownStatus(errors map[string]error) *PulseResponse {
+	details := make(map[string]Status, len(errors))
+	for k, _ := range errors {
+		details[k] = StatusDown
+	}
+	return &PulseResponse{
+		Status:  StatusDown,
+		Details: details,
+	}
+}
+
+func NewUpStatus() *PulseResponse {
+	return &PulseResponse{
+		Status: StatusUp,
+	}
+}
